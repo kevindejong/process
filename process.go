@@ -3,7 +3,6 @@ package process
 import (
 	"context"
 	"sync"
-	"time"
 )
 
 type groupKeyType int
@@ -49,33 +48,6 @@ func NewGroup(ctx context.Context) Group {
 	return g
 }
 
-func (g *group) NewGroup() Group {
-	return NewGroup(g)
-}
-
-func GroupFromContext(ctx context.Context) Group {
-	if g, ok := ctx.(*group); ok {
-		return g
-	}
-	if val, ok := ctx.Value(groupKey).(*group); ok {
-		return val
-	}
-	return NewGroup(ctx)
-}
-
-func (g *group) Join() <-chan struct{} {
-	return g.join
-}
-
-func (g *group) propagateCancel(ctx context.Context) {
-	select {
-	case <-ctx.Done():
-		g.cancel(ctx.Err())
-	case <-g.Context.Done():
-		return
-	}
-}
-
 func (g *group) joinAfterDone() {
 	<-g.Context.Done()
 	g.mu.Lock()
@@ -85,6 +57,10 @@ func (g *group) joinAfterDone() {
 		<-process.Done()
 	}
 	close(g.join)
+}
+
+func (g *group) Join() <-chan struct{} {
+	return g.join
 }
 
 func (g *group) Run(f func(ctx context.Context) error) Process {
@@ -142,13 +118,28 @@ func (g *group) Loop(f func(ctx context.Context) error) Process {
 	return proc
 }
 
-func (g *group) Deadline() (deadline time.Time, ok bool) {
-	return g.Context.Deadline()
-}
-
 func (g *group) Value(key interface{}) interface{} {
 	if key == groupKey {
 		return g
 	}
 	return g.Value(key)
+}
+
+type traceGroup struct {
+	Group
+	trace Context
+}
+
+func (t traceGroup) Err() error {
+	return t.trace.Err()
+}
+
+func GroupFromContext(ctx context.Context) Group {
+	if g, ok := ctx.(*group); ok {
+		return traceGroup{Group: g, trace: WithTrace(g)}
+	}
+	if g, ok := ctx.Value(groupKey).(*group); ok {
+		return traceGroup{Group: g, trace: WithTrace(g)}
+	}
+	return NewGroup(ctx)
 }
