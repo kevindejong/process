@@ -2,21 +2,41 @@ package process
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 )
 
-type Context context.Context
-type CancelFunc func(error)
+type errContextCanceled struct {
+	cause error
+}
+
+func (e *errContextCanceled) Error() string {
+	cause := "<nil>"
+	if e.cause != nil {
+		cause = e.cause.Error()
+	}
+	return fmt.Sprintf("context canceled: %s", cause)
+}
+
+func (e *errContextCanceled) Cause() error {
+	return e.cause
+}
+
+func (e *errContextCanceled) Unwrap() error {
+	return e.cause
+}
 
 type customContext struct {
+	parent context.Context
+
 	mu   sync.Mutex
 	done chan struct{}
 	err  error
-
-	parent context.Context
-	frame  *Frame //the call frame when the context is created
 }
+
+type Context context.Context
+type CancelFunc func(error)
 
 // NewContext returns a new context with a custom error type
 func NewContext() (Context, CancelFunc) {
@@ -25,12 +45,11 @@ func NewContext() (Context, CancelFunc) {
 
 func WithCancel(ctx context.Context) (Context, CancelFunc) {
 	c := &customContext{
-		done:   make(chan struct{}),
 		parent: ctx,
-		frame:  externalFrame(),
+		done:   make(chan struct{}),
 	}
 	go c.propagateCancel()
-	return c, c.cancel
+	return WithTrace(c), c.cancel
 }
 
 func (c *customContext) propagateCancel() {
@@ -45,22 +64,19 @@ func (c *customContext) propagateCancel() {
 func (c *customContext) cancel(err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// prevent multiple cancels from panicking
 	select {
 	case <-c.done:
 		return
 	default:
 	}
 	// always give preference to the parent context
-	if c.parent != nil {
-		select {
-		case <-c.parent.Done():
-			c.err = withContextFrame(c.parent.Err(), c.frame)
-			close(c.done)
-			return
-		default:
-		}
+	select {
+	case <-c.parent.Done():
+		c.err = c.parent.Err()
+	default:
+		c.err = WrapTrace(&errContextCanceled{cause: err})
 	}
-	c.err = withContextFrame(wrapContextFrame(&errContextCanceled{cause: err}), c.frame)
 	close(c.done)
 }
 
@@ -71,33 +87,20 @@ func (c *customContext) Done() <-chan struct{} {
 func (c *customContext) Err() error {
 	// if the parent is canceled, we are racing against propagateCancel so
 	// wait for it to complete
-	if c.parent != nil {
-		select {
-		case <-c.parent.Done():
-			<-c.done
-		default:
-		}
+	select {
+	case <-c.parent.Done():
+		<-c.done
+	default:
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	select {
-	case <-c.done:
-		return wrapContextFrame(c.err)
-	default:
-		return nil
-	}
+	return c.err
 }
 
 func (c *customContext) Value(key interface{}) interface{} {
-	if c.parent != nil {
-		return c.parent.Value(key)
-	}
-	return nil
+	return c.parent.Value(key)
 }
 
 func (c *customContext) Deadline() (deadline time.Time, ok bool) {
-	if c.parent != nil {
-		return c.parent.Deadline()
-	}
-	return time.Time{}, false
+	return c.parent.Deadline()
 }
